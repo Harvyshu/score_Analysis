@@ -13,7 +13,7 @@
   "frequency_penalty": 0.5,
   "n": 1,
   "dp_key": "(your api key)",
-  "stream": false,
+  "stream": true,
   "isTools": false,
   "role_prompt":"你是一位资深的教育学专家，一线老师，也是一位资深的儿童心理学专家，请你根据{dataxlsx_content}的数据分析一下孩子的各科的学习趋势，并且给最近一次的成绩做一次深入的分析，给出鼓励和建议",
   "seed": 4999999999
