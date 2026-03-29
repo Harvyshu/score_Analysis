@@ -13,7 +13,7 @@ from PIL import Image, ImageTk
 import zipfile
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-import threading  # 新增：处理流式请求的线程
+import threading
 import time
 
 # 配置matplotlib中文显示
@@ -28,6 +28,8 @@ TEMPLATE_DIR = os.path.join(os.getcwd(), 'template')
 TMP_DIR = os.path.join(DATA_DIR, 'tmp')
 DEFAULT_AVATAR = os.path.join(os.getcwd(), 'default_avatar.png')
 CONFIG_PATH = os.path.join(os.getcwd(), 'config.json')
+# 全局变量存储流式完整内容
+STREAM_FULL_CONTENT = ""
 
 # 加载配置文件
 try:
@@ -46,7 +48,7 @@ except:
         "frequency_penalty": 0.5,
         "n": 1,
         "dp_key": "",
-        "stream": True,  # 改为true启用流式返回
+        "stream": True,
         "isTools": False,
         "role_prompt": "你是一位资深的教育学专家，一线老师，也是一位资深的儿童心理学专家，请你根据{dataxlsx_content}的数据分析一下孩子的各科的学习趋势，并且给最近一次的成绩做一次深入的分析，给出鼓励和建议",
         "seed": 4999999999,
@@ -183,25 +185,30 @@ def save_stu_data(stu_dir, df):
     shutil.copy(excel_path, os.path.join(TMP_DIR, 'data.xlsx'))
 
 
-# 绘制成绩趋势图
+# 绘制成绩趋势图（恢复原始折线+适配区域大小）
 def draw_score_chart(df, canvas):
+    # 清理画布
     for widget in canvas.winfo_children():
         widget.destroy()
 
+    # 筛选最近8次有效数据
     score_cols = [col for col in df.columns if '_score' in col]
     df = df.dropna(subset=score_cols, how='all').reset_index(drop=True)
     if len(df) == 0:
         tk.Label(canvas, text='未加载成绩数据，暂无图表', font=('宋体', 12)).pack(pady=80)
         return
 
+    # 取最后8条
     df_latest = df.tail(8).reset_index(drop=True)
     total_rows = len(df_latest)
 
+    # 核心：使用最终日期标签（100%无nan）
     if 'date_final' in df_latest.columns:
         x_dates = df_latest['date_final'].tolist()
     else:
         x_dates = [f'第{i + 1}次' for i in range(total_rows)]
 
+    # 终极过滤：遍历检查每一个标签，确保无nan/空值
     clean_x_dates = []
     for i, x in enumerate(x_dates):
         x_str = str(x).strip()
@@ -210,6 +217,7 @@ def draw_score_chart(df, canvas):
         else:
             clean_x_dates.append(x_str)
 
+    # 提取有数据的科目
     all_subjects = ['语文', '数学', '英语', '物理', '化学', '生物', '历史', '地理', '政治']
     valid_subjects = []
     subject_data = {}
@@ -228,43 +236,67 @@ def draw_score_chart(df, canvas):
                 valid_subjects.append(sub)
                 subject_data[sub] = (clean_x_dates, all_y)
 
-    fig, ax = plt.subplots(figsize=(10, 4), dpi=80)
+    # 适配canvas实际大小，优化绘图尺寸
+    canvas_width = canvas.winfo_width() if canvas.winfo_width() > 0 else 1000
+    canvas_height = canvas.winfo_height() if canvas.winfo_height() > 0 else 350
+    fig, ax = plt.subplots(figsize=(canvas_width / 80, canvas_height / 80), dpi=80)
+
     colors = ['blue', 'orange', 'green', 'purple', 'brown', 'pink', 'gray', 'cyan', 'red']
     for idx, sub in enumerate(valid_subjects):
         all_x, all_y = subject_data[sub]
-        ax.plot(all_x, all_y, marker='o', label=sub, color=colors[idx],
-                linewidth=1.5, markersize=4, markerfacecolor='white', markeredgewidth=1.5)
+        # 恢复原始折线：直接绘制实际数据点连接的折线，无平滑
+        valid_x_idx = []  # 有效数据的x轴索引
+        valid_y_vals = []  # 有效数据的y值
+        for i, y_val in enumerate(all_y):
+            if not np.isnan(y_val):
+                valid_x_idx.append(i)
+                valid_y_vals.append(y_val)
 
-    ax.set_xlabel('测试日期/次数', fontsize=10)
-    ax.set_ylabel('成绩', fontsize=10)
-    ax.set_title('成绩趋势图（最近8次）', fontsize=12, fontweight='bold')
+        if len(valid_x_idx) >= 2:
+            # 绘制原始折线（无平滑）
+            ax.plot(valid_x_idx, valid_y_vals, label=sub, color=colors[idx],
+                    linewidth=1.5, alpha=0.8, marker='o', markersize=4,
+                    markerfacecolor=colors[idx], markeredgecolor='white', markeredgewidth=1)
+        elif len(valid_x_idx) == 1:
+            # 只有一个点时直接绘制
+            ax.scatter(valid_x_idx, valid_y_vals, color=colors[idx], s=30, marker='o',
+                       edgecolor='white', linewidth=1, label=sub)
+
+    # 图表样式
+    # ax.set_xlabel('测试日期/次数', fontsize=10)
+    ax.set_ylabel('分值', fontsize=10)
+    ax.set_title('趋势图', fontsize=12, fontweight='bold')
     ax.grid(True, alpha=0.3)
     ax.set_ylim(80, 100)
 
-    ax.set_xticks(clean_x_dates)
+    # 设置x轴刻度为实际日期，减少左右空白
+    ax.set_xticks(range(len(clean_x_dates)))
     ax.set_xticklabels(clean_x_dates, rotation=45, ha='right')
-    ax.set_xlim(left=-0.5, right=len(clean_x_dates) - 0.5)
+    ax.set_xlim(left=-0.2, right=len(clean_x_dates) - 0.8)  # 减少左右空白
 
+    # 图例
     if valid_subjects:
         ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=min(len(valid_subjects), 5),
                   fontsize=8, framealpha=0.8, fancybox=True, shadow=False)
 
-    plt.tight_layout(rect=[0, 0.1, 1, 1])
+    plt.tight_layout(pad=0.5)  # 减少内边距
 
+    # 保存图片
     chart_path = os.path.join(TMP_DIR, 'score_chart.png')
-    fig.savefig(chart_path, bbox_inches='tight', pad_inches=0.2)
+    fig.savefig(chart_path, bbox_inches='tight', pad_inches=0.1, dpi=80)
     plt.close(fig)
 
+    # 显示图片
     try:
         img = tk.PhotoImage(file=chart_path)
         canvas.img = img
         img_label = tk.Label(canvas, image=img)
-        img_label.pack(anchor='center', pady=5)
+        img_label.pack(anchor='center', fill=tk.BOTH, expand=True, padx=0, pady=0)
     except Exception as e:
         tk.Label(canvas, text=f'图表生成失败：{str(e)}', font=('宋体', 12)).pack(pady=80)
 
 
-# 新增：UI更新函数（线程安全）
+# UI更新函数（线程安全）
 def update_report_ui(content, is_append=True):
     """
     安全更新分析报告区域的内容
@@ -275,24 +307,40 @@ def update_report_ui(content, is_append=True):
     def update():
         if not is_append:
             text_report.delete(1.0, tk.END)
-        # 解析markdown并显示
-        parsed_content = parse_markdown(content)
-        text_report.insert(tk.END, parsed_content)
+        # 先临时显示原始内容（流式过程中）
+        text_report.insert(tk.END, content)
         # 滚动到最新内容
         text_report.see(tk.END)
         text_report.update_idletasks()
 
-    # 使用after方法确保在主线程更新UI
     root.after(0, update)
 
 
-# 新增：流式API调用函数
-def call_deepseek_api_stream(prompt):
-    """处理流式返回的API调用"""
+# 重载分析报告（完整解析MD标签）
+def reload_report_content(content):
+    """流式结束后，重载并完整解析MD标签"""
+
+    def update():
+        text_report.delete(1.0, tk.END)
+        parsed_content = parse_markdown(content)
+        text_report.insert(tk.END, parsed_content)
+        text_report.see(tk.END)
+        text_report.update_idletasks()
+
+    root.after(0, update)
+
+
+# 流式API调用函数（修复：保存MD文档+重载报告）
+def call_deepseek_api_stream(prompt, stu_dir):
+    """处理流式返回的API调用，修复保存MD文档"""
+    global STREAM_FULL_CONTENT
+    STREAM_FULL_CONTENT = ""  # 重置全局内容
+
     if not CONFIG['dp_key'] or CONFIG['dp_key'].strip() == '':
         err_msg = '请先在config.json中填写有效的DeepSeek API密钥！'
         update_report_ui(err_msg, False)
         messagebox.showerror('错误', err_msg)
+        STREAM_FULL_CONTENT = err_msg
         return err_msg
 
     session = requests.Session()
@@ -320,11 +368,10 @@ def call_deepseek_api_stream(prompt):
         'top_k': CONFIG['top_k'],
         'frequency_penalty': CONFIG['frequency_penalty'],
         'n': 1,
-        'stream': True,  # 强制流式
+        'stream': True,
         'seed': CONFIG['seed']
     }
 
-    full_content = ""
     try:
         # 发送流式请求
         response = session.post(
@@ -332,7 +379,7 @@ def call_deepseek_api_stream(prompt):
             headers=headers,
             json=data,
             timeout=CONFIG.get('timeout', 60),
-            stream=True  # 启用流式响应
+            stream=True
         )
         response.raise_for_status()
 
@@ -343,41 +390,58 @@ def call_deepseek_api_stream(prompt):
         for line in response.iter_lines():
             if line:
                 line = line.decode('utf-8').strip()
-                # 过滤掉非数据行（如event: ping）
                 if line.startswith('data: '):
                     data_str = line[6:]
-                    if data_str == '[DONE]':  # 流式结束标记
+                    if data_str == '[DONE]':
                         break
                     try:
-                        # 解析单条流式数据
                         chunk = json.loads(data_str)
                         if 'choices' in chunk and len(chunk['choices']) > 0:
                             delta = chunk['choices'][0].get('delta', {})
                             content = delta.get('content', '')
                             if content:
-                                full_content += content
-                                # 实时更新UI（追加内容）
+                                STREAM_FULL_CONTENT += content
                                 update_report_ui(content)
                     except json.JSONDecodeError:
                         continue
 
-        # 流式结束后保存完整报告
-        return full_content
+        # 流式结束后：1.保存MD文档 2.重载报告（完整解析MD）
+        if STREAM_FULL_CONTENT:
+            # 保存MD文档
+            report_dir = os.path.join(stu_dir, 'reports')
+            report_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}成绩分析报告.md'
+            report_path = os.path.join(report_dir, report_name)
+            with open(report_path, 'w', encoding='utf-8') as f:
+                f.write(STREAM_FULL_CONTENT)
+
+            # 重载报告（完整解析MD标签）
+            reload_report_content(STREAM_FULL_CONTENT)
+
+            # 打开报告文件
+            if os.name == 'nt':
+                os.startfile(report_path)
+            else:
+                os.system(f'open {report_path}')
+
+        return STREAM_FULL_CONTENT
 
     except requests.exceptions.Timeout:
         err_msg = f'API请求超时（已重试{CONFIG.get("retry_times", 3)}次）\n建议：检查网络连接/稍后再试'
         update_report_ui(err_msg, False)
         messagebox.showerror('大模型调用失败', err_msg)
+        STREAM_FULL_CONTENT = err_msg
         return err_msg
     except requests.exceptions.ConnectionError:
         err_msg = 'API连接失败\n建议：检查网络连接/代理设置'
         update_report_ui(err_msg, False)
         messagebox.showerror('大模型调用失败', err_msg)
+        STREAM_FULL_CONTENT = err_msg
         return err_msg
     except Exception as e:
         err_msg = f'大模型分析失败：{str(e)}\n建议：检查API密钥/账户余额'
         update_report_ui(err_msg, False)
         messagebox.showerror('大模型调用失败', err_msg)
+        STREAM_FULL_CONTENT = err_msg
         return err_msg
 
 
@@ -428,7 +492,7 @@ def call_deepseek_api_non_stream(prompt):
         response.raise_for_status()
         res_json = response.json()
         content = res_json['choices'][0]['message']['content']
-        update_report_ui(content, False)
+        reload_report_content(content)  # 使用重载函数解析MD
         return content
     except requests.exceptions.Timeout:
         err_msg = f'API请求超时（已重试{CONFIG.get("retry_times", 3)}次）\n建议：检查网络连接/稍后再试'
@@ -445,13 +509,13 @@ def call_deepseek_api_non_stream(prompt):
 
 
 # 统一API调用入口
-def call_deepseek_api(prompt):
+def call_deepseek_api(prompt, stu_dir):
     if CONFIG.get('stream', False):
-        # 流式调用需要在子线程中执行，避免阻塞UI
-        thread = threading.Thread(target=call_deepseek_api_stream, args=(prompt,))
-        thread.daemon = True  # 守护线程，关闭程序时自动退出
+        # 流式调用需要在子线程中执行，传入stu_dir用于保存MD
+        thread = threading.Thread(target=call_deepseek_api_stream, args=(prompt, stu_dir))
+        thread.daemon = True
         thread.start()
-        return "STREAMING"  # 标记为流式处理中
+        return "STREAMING"
     else:
         return call_deepseek_api_non_stream(prompt)
 
@@ -460,9 +524,9 @@ def call_deepseek_api(prompt):
 def generate_report(df, stu_dir):
     data_content = df.to_string(index=False)
     role_prompt = CONFIG['role_prompt'].replace('{dataxlsx_content}', data_content)
-    report_content = call_deepseek_api(role_prompt)
+    report_content = call_deepseek_api(role_prompt, stu_dir)
 
-    # 流式处理时，报告内容在子线程中逐步保存
+    # 非流式时保存报告
     if report_content != "STREAMING":
         report_dir = os.path.join(stu_dir, 'reports')
         report_name = f'{datetime.now().strftime("%Y%m%d_%H%M%S")}成绩分析报告.md'
@@ -477,8 +541,9 @@ def generate_report(df, stu_dir):
     return report_content
 
 
-# 解析markdown
+# 解析markdown（增强版）
 def parse_markdown(md_text):
+    # 处理表格
     table_pattern = re.compile(r'^\|.*\|$', flags=re.M)
     table_lines = table_pattern.findall(md_text)
     if table_lines:
@@ -494,12 +559,25 @@ def parse_markdown(md_text):
                 clean_table.append(' | '.join(formatted_cells))
         md_text = table_pattern.sub('\n'.join(clean_table), md_text)
 
+    # 处理标题
+    md_text = re.sub(r'^# (.*)$', r'\n====== \1 ======\n', md_text, flags=re.M)
     md_text = re.sub(r'^## (.*)$', r'\n【\1】\n', md_text, flags=re.M)
     md_text = re.sub(r'^### (.*)$', r'— \1 —', md_text, flags=re.M)
+
+    # 处理加粗/斜体
     md_text = re.sub(r'\*\*(.*?)\*\*', r'【\1】', md_text)
     md_text = re.sub(r'\*(.*?)\*', r'\1', md_text)
+
+    # 处理分割线
     md_text = re.sub(r'---+', r'================================', md_text)
+
+    # 处理空行
     md_text = re.sub(r'\n{3,}', '\n\n', md_text)
+
+    # 处理列表
+    md_text = re.sub(r'^- (.*)$', r'→ \1', md_text, flags=re.M)
+    md_text = re.sub(r'^\d+\. (.*)$', r'★ \1', md_text, flags=re.M)
+
     return md_text
 
 
@@ -667,39 +745,35 @@ def load_avatar():
 # 加载最新报告
 def load_latest_report():
     if not STU_DIR:
-        update_report_ui('未加载学生，暂无报告', False)
+        reload_report_content('未加载学生，暂无报告')
         return
     report_dir = os.path.join(STU_DIR, 'reports')
     if not os.path.exists(report_dir):
-        update_report_ui('暂无分析报告', False)
+        reload_report_content('暂无分析报告')
         return
     report_files = [f for f in os.listdir(report_dir) if f.endswith('.md')]
     if not report_files:
-        update_report_ui('暂无分析报告', False)
+        reload_report_content('暂无分析报告')
         return
     report_files.sort(reverse=True)
     latest_report = os.path.join(report_dir, report_files[0])
     try:
         with open(latest_report, 'r', encoding='utf-8') as f:
             content = f.read()
-        update_report_ui(content, False)
+        reload_report_content(content)
     except:
-        update_report_ui('报告文件读取失败', False)
+        reload_report_content('报告文件读取失败')
 
 
-# 展示报告内容（兼容新的UI更新函数）
-def show_report(content):
-    update_report_ui(content, False)
-
-
-# 主UI初始化
+# 主UI初始化（固定窗口大小）
 def init_main_ui():
     global root, label_avatar, label_stu_name, canvas_chart, text_report
 
     root = tk.Tk()
     root.title('学生成绩统计与分析工具')
+    # 固定窗口大小为1250x800，不可调整
     root.geometry('1250x800')
-    root.resizable(True, True)
+    root.resizable(False, False)  # 禁用窗口大小调整
 
     frame_row1 = ttk.Frame(root)
     frame_row1.pack(fill=tk.X, padx=10, pady=10)
@@ -731,7 +805,6 @@ def init_main_ui():
 
     scroll_report = ttk.Scrollbar(frame_report)
     scroll_report.pack(side=tk.RIGHT, fill=tk.Y)
-    # 全局text_report变量，供流式更新使用
     text_report = tk.Text(frame_report, yscrollcommand=scroll_report.set, font=('宋体', 11), wrap=tk.WORD)
     text_report.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
     scroll_report.config(command=text_report.yview)
@@ -746,7 +819,7 @@ def init_main_ui():
     frame_chart.pack_propagate(False)
 
     canvas_chart = ttk.Frame(frame_chart)
-    canvas_chart.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+    canvas_chart.pack(fill=tk.BOTH, expand=True, padx=0, pady=0)  # 移除内边距
     tk.Label(canvas_chart, text='未加载成绩数据，暂无图表', font=('宋体', 12)).pack(pady=80)
 
     load_avatar()
@@ -758,10 +831,11 @@ def init_main_ui():
 if __name__ == '__main__':
     try:
         from PIL import Image, ImageTk
-    except ImportError:
+    except ImportError as e:
         import subprocess
         import sys
 
+        # 只安装Pillow，无需scipy
         subprocess.check_call([sys.executable, "-m", "pip", "install", "Pillow"])
         from PIL import Image, ImageTk
 
